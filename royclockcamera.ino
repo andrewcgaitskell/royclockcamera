@@ -71,6 +71,9 @@ int lastPhotoHour = -1;
 // Simple flag to avoid stream/capture races (minimal approach)
 volatile bool capturing = false;
 
+// Track whether SD mount succeeded
+bool sd_mounted = false;
+
 // ---------- Streaming handler (simple check for capture in progress) ----------
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
@@ -250,8 +253,10 @@ static esp_err_t init_sdcard() {
   esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
   if (ret == ESP_OK) {
     Serial.println("SD card mount successfully!");
+    sd_mounted = true;
   } else {
     Serial.printf("Failed to mount SD card VFAT filesystem. Error: %s\n", esp_err_to_name(ret));
+    sd_mounted = false;
   }
   return ret;
 }
@@ -355,6 +360,14 @@ String getContentTypeForFilename(const String& path) {
 
 // ---------- /files handler: list files on SD (simple HTML) ----------
 static esp_err_t files_get_handler(httpd_req_t *req) {
+  Serial.println("/files handler called");
+  if (!sd_mounted) {
+    const char* msg = "SD card not mounted. /files unavailable.\n";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, msg, strlen(msg));
+    return ESP_OK;
+  }
+
   // Send a basic HTML page in chunks (avoid building one big string)
   const char* header = "<!doctype html><html><head><meta charset='utf-8'><title>ESP32-CAM SD Files</title></head><body><h2>Files on SD card</h2>";
   httpd_resp_send_chunk(req, header, strlen(header));
@@ -450,12 +463,15 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
 
 // ---------- /capture handler: take a dated photo and return link ----------
 static esp_err_t capture_get_handler(httpd_req_t *req) {
-  Serial.println("HTTP /capture requested - triggering capture");
+  Serial.println("/capture handler called");
 
   // Indicate capture in progress so streaming won't race with camera
   capturing = true;
   String saved = save_photo_dated_str(); // returns full path or empty
   capturing = false;
+
+  Serial.print("capture result: ");
+  Serial.println(saved);
 
   if (saved.length()) {
     // produce a simple text response with link
@@ -469,7 +485,7 @@ static esp_err_t capture_get_handler(httpd_req_t *req) {
     return ESP_OK;
   } else {
     httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "Capture failed", strlen("Capture failed"));
+    httpd_resp_send(req, "Capture failed. Check Serial output.\n", strlen("Capture failed. Check Serial output.\n"));
     return ESP_FAIL;
   }
 }
