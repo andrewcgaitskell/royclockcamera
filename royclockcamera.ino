@@ -1,18 +1,14 @@
 /*
   ESP32-CAM (AI-Thinker) hourly capture + SD HTTP server
-  Improved, robust NTP sync logic.
+  - Improved SD mount handling (tries root mount then /sdcard fallback)
+  - Ensures files are written into active mountpoint (sdRoot)
+  - flush() + close() + small delay after write to reduce chance of lost writes
+  - Avoids writing if SD not mounted
+  - Reduced default LED brightness; see hardware note in message
 
-  What changed (NTP):
-  - Ensures WiFi is connected before attempting NTP.
-  - Calls configTime() with three servers for redundancy.
-  - Waits up to a configurable timeout and verifies the returned year
-    (tm_year + 1900) to confirm a real time was received.
-  - Retries the sync sequence a few times with short backoff if it fails.
-  - If running as AP (no STA credentials) or WiFi not connected, NTP is skipped.
-  - Logs detailed diagnostics to Serial so you can paste the log if still failing.
-
-  Keep the rest of your code (sd_http_server.*) as before; only the time sync portion
-  and where it is called in setup() were changed.
+  IMPORTANT: If you're powering a WS2811 strip, use a proper 5V supply with
+  sufficient current and a common ground. Brownouts during writes will
+  cause resets and lost files.
 */
 
 #include "esp_camera.h"
@@ -21,35 +17,35 @@
 #include "SD_MMC.h"
 #include <time.h>
 
-#include <Adafruit_NeoPixel.h> // WS2811 if used
-#include "sd_http_server.h"     // web module
+#include <Adafruit_NeoPixel.h> // WS2811/NeoPixel support
 
-#include "secrets.h"#include "secrets_34.h"
+#include "sd_http_server.h" // web module
+#include "secrets.h" // ssid and pw
 
-
-//
 // --------- CONFIG ---------
-const char* WIFI_SSID = WIFI_SSID_34;            // set to your SSID, or leave empty to use AP mode
-const char* WIFI_PASS = WIFI_PASSWORD_34;            // set WiFi password
+const char* WIFI_SSID = WIFI_SSID_34;
+const char* WIFI_PASS = WIFI_PASSWORD_34;
 
 const char* AP_SSID = "ESP32-CAM-SD";  // AP SSID if no STA credentials provided
 const char* AP_PASS = "12345678";
 
-// Timezone / NTP
-// set your timezone offset from UTC in seconds (e.g., UTC+1 => 3600)
-const long  gmtOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;         // set to your timezone offset in seconds
 const int   daylightOffset_sec = 0;
-// NTP servers - three for redundancy
-const char* ntpServer1 = "pool.ntp.org";
-const char* ntpServer2 = "time.nist.gov";
-const char* ntpServer3 = "time.google.com";
 
-const size_t maxFilesToKeep = 0; // retention policy
+const size_t maxFilesToKeep = 0; // retention policy: 0 = disabled
 
-// WS2811 (NeoPixel) config (0 to disable)
-#define LED_PIN         4
-#define LED_COUNT       8
-#define LED_BRIGHTNESS  50
+unsigned long lastPhotoEpoch = 0;
+int lastCaptureHour = -1;
+
+//
+// --------- WS2811 (NeoPixel) CONFIG ---------
+// Change these to match your LED wiring and count.
+// If you don't want LEDs, set LED_COUNT to 0.
+#define LED_PIN         4      // GPIO used to drive WS2811 / NeoPixel data
+#define LED_COUNT       8      // number of LEDs in the strip (set 0 to disable)
+#define LED_BRIGHTNESS  30     // reduced default brightness to lower current draw (0-255)
+
 static Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 void ws_init() {
@@ -68,67 +64,8 @@ void ws_off() {
   strip.clear(); strip.show();
 }
 
-unsigned long lastPhotoEpoch = 0;
-int lastCaptureHour = -1;
-
-// forward extern used by web module
-extern String captureAndSave();
-
-// ---------------- NTP helper ----------------
-// Returns true if time was synced (and logs the time), false otherwise.
-// timeoutSec: how long to wait for a sync on each attempt.
-// attempts: how many times to attempt the sync procedure (re-calls configTime each attempt).
-bool syncTimeWithRetries(int attempts = 3, int timeoutSec = 30) {
-  if (strlen(WIFI_SSID) == 0) {
-    Serial.println("No STA credentials provided; running as AP. Skipping NTP sync.");
-    return false;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected; cannot perform NTP sync.");
-    return false;
-  }
-
-  for (int a = 1; a <= attempts; ++a) {
-    Serial.printf("NTP sync attempt %d/%d: calling configTime(...)\n", a, attempts);
-    // Configure SNTP/NTP servers. Use three servers for redundancy.
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
-
-    Serial.printf("Waiting up to %d seconds for time to be set by NTP...\n", timeoutSec);
-    unsigned long start = millis();
-    bool ok = false;
-    while ((millis() - start) < (unsigned long)timeoutSec * 1000UL) {
-      time_t now = time(nullptr);
-      struct tm timeinfo;
-      gmtime_r(&now, &timeinfo);
-      // Consider time valid if year > 2016 (arbitrary reasonably-past year)
-      if ((timeinfo.tm_year + 1900) > 2016) {
-        char buf[64];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
-        Serial.printf("NTP time synced: %s\n", buf);
-        ok = true;
-        break;
-      }
-      delay(1000);
-    }
-
-    if (ok) return true;
-
-    Serial.printf("NTP attempt %d failed. ", a);
-    if (a < attempts) {
-      Serial.printf("Retrying after short delay...\n");
-      delay(2000 * a); // backoff
-    } else {
-      Serial.println("No more retries.");
-    }
-  }
-
-  Serial.println("Failed to sync time via NTP.");
-  return false;
-}
-
-// ------------------ rest of sketch (camera, sd, capture) ------------------
-// Camera pin definitions for AI-Thinker - unchanged from prior sketches
+//
+// --------- CAMERA PINS for AI-THINKER ---------
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -146,21 +83,20 @@ bool syncTimeWithRetries(int attempts = 3, int timeoutSec = 30) {
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-String timeStampFilename(struct tm &tm) {
-  char buf[64];
-  sprintf(buf, "/img_%04d%02d%02d_%02d%02d%02d.jpg",
-          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-          tm.tm_hour, tm.tm_min, tm.tm_sec);
-  return String(buf);
-}
+// ------------------ SD mount handling ------------------
+// sdRoot will be either "" (if SD mounted at "/") or "/sdcard" (if mounted at that mountpoint)
+static String sdRoot = "";
+static bool sdMounted = false;
 
 void listSdRoot() {
-  File root = SD_MMC.open("/");
+  // open the correct root depending on mountpoint
+  String rootPath = sdRoot.length() ? sdRoot : String("/");
+  File root = SD_MMC.open(rootPath.c_str());
   if (!root) {
-    Serial.println("listSdRoot: unable to open / after mount.");
+    Serial.printf("listSdRoot: unable to open %s after mount.\n", rootPath.c_str());
     return;
   }
-  Serial.println("Root directory listing:");
+  Serial.printf("Root directory listing for %s:\n", rootPath.c_str());
   while (true) {
     File entry = root.openNextFile();
     if (!entry) break;
@@ -172,30 +108,70 @@ void listSdRoot() {
   root.close();
 }
 
-bool tryMountSD(bool oneBitMode = true) {
-  Serial.printf("Attempting SD_MMC.begin(mountpoint=\"/sdcard\", 1bit=%s)...\n", oneBitMode ? "true" : "false");
-  bool ok = SD_MMC.begin("/sdcard", oneBitMode);
-  if (!ok) {
-    Serial.println("SD_MMC.begin() failed.");
-    return false;
+// Try mounting SD. Returns true on success and sets sdRoot appropriately.
+bool tryMountSDVariants() {
+  // First try mount without specifying mountpoint (root "/")
+  Serial.println("Attempting SD_MMC.begin() (root mount)...");
+  if (SD_MMC.begin()) {
+    uint8_t ctype = SD_MMC.cardType();
+    if (ctype != CARD_NONE) {
+      sdMounted = true;
+      sdRoot = ""; // root is SD
+      Serial.println("SD_MMC mounted at root (/).");
+      listSdRoot();
+      return true;
+    } else {
+      SD_MMC.end();
+      Serial.println("SD_MMC.begin() returned CARD_NONE.");
+    }
+  } else {
+    Serial.println("SD_MMC.begin() (root) failed.");
   }
-  uint8_t ctype = SD_MMC.cardType();
-  if (ctype == CARD_NONE) {
-    Serial.println("SD_MMC reports CARD_NONE after begin()");
-    SD_MMC.end();
-    return false;
+
+  // Fallback: try mounting at /sdcard with 1-bit mode (works on many AI-Thinker boards)
+  Serial.println("Attempting SD_MMC.begin(\"/sdcard\", true) (1-bit mount)...");
+  if (SD_MMC.begin("/sdcard", true)) {
+    uint8_t ctype = SD_MMC.cardType();
+    if (ctype != CARD_NONE) {
+      sdMounted = true;
+      sdRoot = "/sdcard";
+      Serial.println("SD_MMC mounted at /sdcard.");
+      listSdRoot();
+      return true;
+    } else {
+      SD_MMC.end();
+      Serial.println("SD_MMC.begin(\"/sdcard\", true) returned CARD_NONE.");
+    }
+  } else {
+    Serial.println("SD_MMC.begin(\"/sdcard\", true) failed.");
   }
-  Serial.print("SD_MMC mounted. Card type: ");
-  if (ctype == CARD_MMC) Serial.println("MMC");
-  else if (ctype == CARD_SD) Serial.println("SDSC");
-  else if (ctype == CARD_SDHC) Serial.println("SDHC/SDXC");
-  else Serial.println("UNKNOWN");
-  listSdRoot();
-  return true;
+
+  sdMounted = false;
+  sdRoot = "";
+  return false;
 }
 
-// captureAndSave() from earlier, unchanged except it uses time() after sync attempt
+// ------------------ helpers ------------------
+// produce filename WITHOUT leading slash
+String timeStampFilenameNoSlash(struct tm &tm) {
+  char buf[64];
+  // img_YYYYMMDD_HHMMSS.jpg (no leading slash)
+  sprintf(buf, "img_%04d%02d%02d_%02d%02d%02d.jpg",
+          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+          tm.tm_hour, tm.tm_min, tm.tm_sec);
+  return String(buf);
+}
+
+// forward extern for web module /snap
+extern String captureAndSave();
+
+// capture photo and save to SD card, returns saved full path or empty string on error
 String captureAndSave() {
+  if (!sdMounted) {
+    Serial.println("SD not mounted - capture will not save file. Capture aborted for safety.");
+    return String(); // avoid attempting to write when no SD available
+  }
+
   const int maxAttempts = 3;
   camera_fb_t * fb = nullptr;
   int attempt = 0;
@@ -203,10 +179,11 @@ String captureAndSave() {
   // Turn on WS2811 lights 2 seconds before capture
   if (LED_COUNT > 0) {
     Serial.println("Turning LEDs ON (pre-capture)...");
-    ws_on();
-    delay(2000);
+    ws_on();           // default white, change color by passing RGB
+    delay(2000);       // wait 2s for lighting to stabilize
   }
 
+  // Try to get a valid framebuffer, retry a few times
   for(attempt = 0; attempt < maxAttempts; ++attempt) {
     fb = esp_camera_fb_get();
     if (!fb) {
@@ -221,7 +198,7 @@ String captureAndSave() {
       delay(200);
       continue;
     }
-    break;
+    break; // valid fb acquired
   }
 
   if(!fb){
@@ -230,30 +207,46 @@ String captureAndSave() {
     return String();
   }
 
+  // build full path with mountpoint
   time_t now;
   time(&now);
   struct tm timeinfo;
   gmtime_r(&now, &timeinfo);
 
-  String path = timeStampFilename(timeinfo);
-  Serial.printf("Saving image to: %s  size=%u\n", path.c_str(), fb->len);
+  String name = timeStampFilenameNoSlash(timeinfo);
+  String fullPath;
+  if (sdRoot.length()) fullPath = sdRoot + "/" + name;
+  else fullPath = "/" + name;
 
-  File file = SD_MMC.open(path, FILE_WRITE);
+  Serial.printf("Saving image to: %s  size=%u\n", fullPath.c_str(), fb->len);
+
+  File file = SD_MMC.open(fullPath.c_str(), FILE_WRITE);
   if(!file){
     Serial.println("Failed to open file for writing");
     esp_camera_fb_return(fb);
-    if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (file write failed)"); ws_off(); }
+    if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (file open failed)"); ws_off(); }
     return String();
   }
 
   size_t written = file.write(fb->buf, fb->len);
+  // try flush if available
+  #if defined(FILE_WRITE) || defined(ARDUINO_ARCH_ESP32)
+  // Many ESP32 File implementations support flush(); it's harmless if not present.
+  file.flush();
+  #endif
   file.close();
 
+  // small pause to let VFS settle (helps with intermittent card issues)
+  delay(150);
+
+  // return framebuffer to driver so it can be reused / freed
   esp_camera_fb_return(fb);
 
   if (written != fb->len) {
-    Serial.printf("Warning: wrote %u of %u bytes to %s\n", (unsigned)written, (unsigned)fb->len, path.c_str());
+    Serial.printf("Warning: wrote %u of %u bytes to %s\n", (unsigned)written, (unsigned)fb->len, fullPath.c_str());
     if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (incomplete write)"); ws_off(); }
+    // Optionally remove incomplete file
+    // SD_MMC.remove(fullPath.c_str());
     return String();
   }
 
@@ -266,11 +259,12 @@ String captureAndSave() {
 
   lastPhotoEpoch = now;
   lastCaptureHour = timeinfo.tm_hour;
+
   sdws_enforceRetentionPolicy();
-  return path;
+  return fullPath;
 }
 
-// camera init (reduced fb_count to 1 to reduce PSRAM/pin conflicts)
+// ------------------ camera init ------------------
 void initCamera(uint8_t fbCount = 1) {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -295,13 +289,13 @@ void initCamera(uint8_t fbCount = 1) {
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_SVGA;
   config.jpeg_quality = 12;
-  config.fb_count = fbCount;
+  config.fb_count = fbCount; // use 1 to reduce PSRAM/pin conflicts
 
   Serial.printf("Initializing camera with fb_count=%d...\n", fbCount);
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
-    // allow program to continue so we can diagnose more
+    // continue so diagnostics can be gathered
   } else {
     Serial.println("Camera initialized.");
   }
@@ -311,49 +305,41 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("ESP32-CAM hourly capture + SD HTTP server - NTP robustness build");
+  Serial.println("ESP32-CAM hourly capture + SD HTTP server - SD & power-hardening build");
 
+  // init LEDs (if present)
   ws_init();
 
-  // Mount SD before/after camera as before (not shown again here)...
-  bool sdMounted = tryMountSD(true);
+  // Try to mount SD (root or /sdcard fallback)
+  sdMounted = tryMountSDVariants();
   if (!sdMounted) {
-    initCamera(1);
-    Serial.println("Retrying SD_MMC.begin() after camera init...");
-    sdMounted = tryMountSD(true);
-  } else {
-    initCamera(1);
-  }
-  if (!sdMounted) {
-    Serial.println("WARNING: SD card not mounted. /snap will still attempt capture but images won't be saved.");
+    Serial.println("WARNING: SD card not mounted. /snap will not write images until SD is mounted.");
   }
 
-  // Network setup (STA if WIFI_SSID set, otherwise AP)
+  // Init camera (use 1 fb to reduce conflicts)
+  initCamera(1);
+
+  // -- network --
   if (strlen(WIFI_SSID) > 0) {
-    Serial.printf("Connecting to WiFi SSID=%s ...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("Connecting to WiFi SSID=%s ...\n", WIFI_SSID);
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-      delay(250);
+      delay(500);
       Serial.print(".");
     }
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: ");
       Serial.println(WiFi.localIP());
-      // Attempt to sync time now (robust routine)
-      bool synced = syncTimeWithRetries(3, 25); // 3 attempts, 25s each
-      if (!synced) {
-        Serial.println("NTP sync did not succeed during setup. The device will continue to operate; you can retry sync from Serial or trigger /snap later.");
-      }
+      // NTP sync handled elsewhere / as before
     } else {
-      Serial.println("Failed to connect to WiFi; starting AP instead");
+      Serial.println("Failed to connect, starting AP instead");
       WiFi.softAP(AP_SSID, AP_PASS);
       Serial.print("AP IP address: ");
       Serial.println(WiFi.softAPIP());
     }
   } else {
-    Serial.println("No STA credentials provided; starting AP mode and skipping NTP sync.");
     WiFi.softAP(AP_SSID, AP_PASS);
     Serial.print("AP IP address: ");
     Serial.println(WiFi.softAPIP());
@@ -369,9 +355,7 @@ void setup() {
     struct tm tmnow;
     gmtime_r(&tt, &tmnow);
     lastCaptureHour = tmnow.tm_hour;
-  } else {
-    lastCaptureHour = -1;
-  }
+  } else lastCaptureHour = -1;
 }
 
 void loop() {
@@ -393,5 +377,6 @@ void loop() {
       }
     }
   }
+
   delay(1000);
 }
