@@ -35,6 +35,9 @@
 #include "secrets_34.h"
 #include "secrets_roy.h"
 
+// for fsync
+#include <unistd.h>
+
 #define PART_BOUNDARY "123456789000000000000987654321"
 #define CAMERA_MODEL_AI_THINKER
 
@@ -261,7 +264,7 @@ static esp_err_t init_sdcard() {
   return ret;
 }
 
-// ---------- Image saving helpers (minimal changes: binary write) ----------
+// ---------- Image saving helpers (minimal changes: flush camera fb then get a fresh one + fsync) ----------
 String make_dated_filename() {
   time_t now;
   struct tm timeinfo;
@@ -282,23 +285,53 @@ String make_numbered_filename() {
   return String(filename);
 }
 
+// Helper: flush the camera's current framebuffer(s) by grabbing and returning one, short delay,
+// then attempt to capture a fresh framebuffer. Retries to be robust.
+static camera_fb_t* flush_and_get_new_fb(int retries = 5, int delay_ms = 60) {
+  camera_fb_t *fb = NULL;
+
+  // If there's a currently held framebuffer inside the driver, get & return it to "flush"
+  fb = esp_camera_fb_get();
+  if (fb) {
+    esp_camera_fb_return(fb);
+    fb = NULL;
+    // small pause to let camera advance
+    delay(delay_ms);
+  }
+
+  // Now try to get a fresh frame
+  for (int i = 0; i < retries; ++i) {
+    fb = esp_camera_fb_get();
+    if (fb && fb->len > 0) return fb;
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    }
+    delay(delay_ms);
+  }
+  return NULL;
+}
+
 // returns empty string on failure, or full path on success
 String save_photo_numbered_str() {
   String filename = make_numbered_filename();
   Serial.print("Taking picture: ");
   Serial.println(filename);
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = flush_and_get_new_fb();
   if (!fb) {
-    Serial.println("Camera capture failed (DMA overflow?)");
+    Serial.println("Camera capture failed (no fresh fb)");
     return String();
   }
 
-  // write in binary mode ("wb")
+  // write in binary mode ("wb") and ensure flush to SD
   FILE *file = fopen(filename.c_str(), "wb");
   if (file != NULL) {
-    fwrite(fb->buf, 1, fb->len, file);
-    Serial.printf("File saved: %s\n", filename.c_str());
+    size_t written = fwrite(fb->buf, 1, fb->len, file);
+    fflush(file);
+    int fd = fileno(file);
+    if (fd >= 0) fsync(fd);
+    Serial.printf("File saved: %s (bytes: %u)\n", filename.c_str(), (unsigned)written);
     fclose(file);
   } else {
     Serial.println("Could not open file for writing");
@@ -314,17 +347,20 @@ String save_photo_dated_str() {
   Serial.print("Taking picture: ");
   Serial.println(filename);
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = flush_and_get_new_fb();
   if (!fb) {
-    Serial.println("Camera capture failed (DMA overflow?)");
+    Serial.println("Camera capture failed (no fresh fb)");
     return String();
   }
 
-  // write in binary mode ("wb")
+  // write in binary mode ("wb") and ensure flush to SD
   FILE *file = fopen(filename.c_str(), "wb");
   if (file != NULL) {
-    fwrite(fb->buf, 1, fb->len, file);
-    Serial.printf("File saved: %s\n", filename.c_str());
+    size_t written = fwrite(fb->buf, 1, fb->len, file);
+    fflush(file);
+    int fd = fileno(file);
+    if (fd >= 0) fsync(fd);
+    Serial.printf("File saved: %s (bytes: %u)\n", filename.c_str(), (unsigned)written);
     fclose(file);
   } else {
     Serial.println("Could not open file for writing");
@@ -439,6 +475,10 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
 
   String ctype = getContentTypeForFilename(filename);
   httpd_resp_set_type(req, ctype.c_str());
+
+  // Prevent browser caching of download results
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+  httpd_resp_set_hdr(req, "Pragma", "no-cache");
 
   // Content-Disposition header to force download
   String disp = "attachment; filename=\"" + filename + "\"";
@@ -585,3 +625,4 @@ void loop() {
     delay(200);
   }
 }
+
