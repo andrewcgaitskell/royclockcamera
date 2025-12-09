@@ -35,11 +35,6 @@
 #include "secrets_34.h"
 #include "secrets_roy.h"
 
-// Added for camera access synchronization and fsync
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include <unistd.h>
-
 #define PART_BOUNDARY "123456789000000000000987654321"
 #define CAMERA_MODEL_AI_THINKER
 
@@ -73,10 +68,10 @@ bool internet_connected = false;
 unsigned long lastNtpSync = 0;
 int lastPhotoHour = -1;
 
-// Camera mutex to avoid concurrent esp_camera_fb_get usage (stream vs capture)
-static SemaphoreHandle_t cameraLock = NULL;
+// Simple flag to avoid stream/capture races (minimal approach)
+volatile bool capturing = false;
 
-// ---------- Streaming handler (unchanged but now mutex-protected) ----------
+// ---------- Streaming handler (simple check for capture in progress) ----------
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
@@ -88,13 +83,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   if (res != ESP_OK) return res;
 
   while (true) {
-    // try to lock camera for this iteration
-    if (cameraLock) {
-      if (xSemaphoreTake(cameraLock, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        Serial.println("stream_handler: camera locked by other task");
-        res = ESP_FAIL;
-        break;
-      }
+    // If a capture is in progress, wait a bit so we don't race the capture code
+    if (capturing) {
+      delay(50);
+      continue;
     }
 
     fb = esp_camera_fb_get();
@@ -117,12 +109,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         }
       }
     }
-
-    // release camera lock as soon as we've either returned the fb or taken its data
-    if (cameraLock) {
-      xSemaphoreGive(cameraLock);
-    }
-
     if (res == ESP_OK) {
       size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
       res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
@@ -270,7 +256,7 @@ static esp_err_t init_sdcard() {
   return ret;
 }
 
-// ---------- Image saving helpers (modified to return filename) ----------
+// ---------- Image saving helpers (minimal changes: binary write) ----------
 String make_dated_filename() {
   time_t now;
   struct tm timeinfo;
@@ -297,39 +283,24 @@ String save_photo_numbered_str() {
   Serial.print("Taking picture: ");
   Serial.println(filename);
 
-  if (cameraLock) {
-    if (xSemaphoreTake(cameraLock, pdMS_TO_TICKS(2000)) != pdTRUE) {
-      Serial.println("save_photo_numbered_str: camera busy");
-      return String();
-    }
-  }
-
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed (DMA overflow?)");
-    if (cameraLock) xSemaphoreGive(cameraLock);
     return String();
   }
 
-  // write in binary mode and ensure data is flushed to SD
+  // write in binary mode ("wb")
   FILE *file = fopen(filename.c_str(), "wb");
   if (file != NULL) {
-    size_t written = fwrite(fb->buf, 1, fb->len, file);
-    fflush(file);
-    int fd = fileno(file);
-    if (fd >= 0) {
-      fsync(fd);
-    }
-    Serial.printf("File saved: %s (bytes: %u)\n", filename.c_str(), (unsigned)written);
+    fwrite(fb->buf, 1, fb->len, file);
+    Serial.printf("File saved: %s\n", filename.c_str());
     fclose(file);
   } else {
     Serial.println("Could not open file for writing");
     esp_camera_fb_return(fb);
-    if (cameraLock) xSemaphoreGive(cameraLock);
     return String();
   }
   esp_camera_fb_return(fb);
-  if (cameraLock) xSemaphoreGive(cameraLock);
   return filename;
 }
 
@@ -338,39 +309,24 @@ String save_photo_dated_str() {
   Serial.print("Taking picture: ");
   Serial.println(filename);
 
-  if (cameraLock) {
-    if (xSemaphoreTake(cameraLock, pdMS_TO_TICKS(2000)) != pdTRUE) {
-      Serial.println("save_photo_dated_str: camera busy");
-      return String();
-    }
-  }
-
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed (DMA overflow?)");
-    if (cameraLock) xSemaphoreGive(cameraLock);
     return String();
   }
 
-  // write in binary mode and ensure data is flushed to SD
+  // write in binary mode ("wb")
   FILE *file = fopen(filename.c_str(), "wb");
   if (file != NULL) {
-    size_t written = fwrite(fb->buf, 1, fb->len, file);
-    fflush(file);
-    int fd = fileno(file);
-    if (fd >= 0) {
-      fsync(fd);
-    }
-    Serial.printf("File saved: %s (bytes: %u)\n", filename.c_str(), (unsigned)written);
+    fwrite(fb->buf, 1, fb->len, file);
+    Serial.printf("File saved: %s\n", filename.c_str());
     fclose(file);
   } else {
     Serial.println("Could not open file for writing");
     esp_camera_fb_return(fb);
-    if (cameraLock) xSemaphoreGive(cameraLock);
     return String();
   }
   esp_camera_fb_return(fb);
-  if (cameraLock) xSemaphoreGive(cameraLock);
   return filename;
 }
 
@@ -471,10 +427,6 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   String ctype = getContentTypeForFilename(filename);
   httpd_resp_set_type(req, ctype.c_str());
 
-  // Prevent browser caching of download results so refreshed downloads always fetch current file
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
-  httpd_resp_set_hdr(req, "Pragma", "no-cache");
-
   // Content-Disposition header to force download
   String disp = "attachment; filename=\"" + filename + "\"";
   httpd_resp_set_hdr(req, "Content-Disposition", disp.c_str());
@@ -499,7 +451,12 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
 // ---------- /capture handler: take a dated photo and return link ----------
 static esp_err_t capture_get_handler(httpd_req_t *req) {
   Serial.println("HTTP /capture requested - triggering capture");
+
+  // Indicate capture in progress so streaming won't race with camera
+  capturing = true;
   String saved = save_photo_dated_str(); // returns full path or empty
+  capturing = false;
+
   if (saved.length()) {
     // produce a simple text response with link
     String rel = saved;
@@ -522,12 +479,6 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   Serial.setDebugOutput(false);
-
-  // create camera mutex
-  cameraLock = xSemaphoreCreateMutex();
-  if (!cameraLock) {
-    Serial.println("Failed to create camera mutex");
-  }
 
   // Camera pin setup
   config.ledc_channel = LEDC_CHANNEL_0;
