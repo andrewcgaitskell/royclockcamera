@@ -4,9 +4,9 @@
 
   Minimal changes to reliably avoid stale saved images:
   - single FreeRTOS mutex (cameraLock) to serialize camera access
-  - flush_and_get_new_fb() to force a fresh frame, with retries
+  - improved flush_and_get_new_fb() which compares a small checksum to ensure a new frame
   - binary writes + fflush+fsync
-  - added save_photo(bool) to fix compile error
+  - save_photo(bool) to provide a single safe API
 */
 
 #include "esp_camera.h"
@@ -99,33 +99,77 @@ String make_numbered_filename() {
   return String(filename);
 }
 
-// Try to flush any currently held fb from the driver and then get a fresh one.
-// Retries and small delays make this robust.
-static camera_fb_t* flush_and_get_new_fb(int retries = 6, int delay_ms = 80) {
-  camera_fb_t *fb = NULL;
+// small, cheap checksum over the first sample_size bytes
+static uint32_t fb_sample_checksum(camera_fb_t *fb, size_t sample_size = 64) {
+  if (!fb || fb->len == 0) return 0;
+  size_t n = fb->len < sample_size ? fb->len : sample_size;
+  uint32_t h = 2166136261u; // FNV-1a 32-bit start
+  for (size_t i = 0; i < n; ++i) {
+    h ^= fb->buf[i];
+    h *= 16777619u;
+  }
+  return h;
+}
 
-  // If possible, get and return to flush a held buffer
+// Improved flush-and-get-new-fb:
+// 1) grab a frame (if any) and compute a small checksum
+// 2) discard it, then repeatedly grab new frames and compare checksum
+// 3) return the first frame that differs (or last frame if retries exhausted)
+static camera_fb_t* flush_and_get_new_fb(int retries = 10, int delay_ms = 80, size_t sample_size = 64) {
+  camera_fb_t *fb = NULL;
+  uint32_t prev_hash = 0;
+
+  // Try to get a current frame to determine the "previous" hash.
   fb = esp_camera_fb_get();
   if (fb) {
+    prev_hash = fb_sample_checksum(fb, sample_size);
+    esp_camera_fb_return(fb);
+    fb = NULL;
+    // short pause for the camera to advance to next buffer
+    delay(delay_ms);
+  }
+
+  // Now try to get a fresh frame that differs from prev_hash
+  for (int i = 0; i < retries; ++i) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      delay(delay_ms);
+      continue;
+    }
+    // If we had no previous frame (prev_hash==0) we accept the first valid fb
+    if (prev_hash == 0) {
+      if (fb->len > 0) return fb;
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      delay(delay_ms);
+      continue;
+    }
+
+    uint32_t h = fb_sample_checksum(fb, sample_size);
+    if (h != prev_hash && fb->len > 0) {
+      // different from previous — consider it fresh
+      return fb;
+    }
+
+    // same as previous: return and retry (discard)
     esp_camera_fb_return(fb);
     fb = NULL;
     delay(delay_ms);
   }
 
-  for (int i = 0; i < retries; ++i) {
-    fb = esp_camera_fb_get();
-    if (fb && fb->len > 0) return fb;
-    if (fb) {
-      esp_camera_fb_return(fb);
-      fb = NULL;
-    }
-    delay(delay_ms);
+  // last-ditch: try one final get without comparison
+  fb = esp_camera_fb_get();
+  if (fb && fb->len > 0) return fb;
+  if (fb) {
+    esp_camera_fb_return(fb);
+    fb = NULL;
   }
   return NULL;
 }
 
-// save_photo implementation (was missing) - performs the same safe capture+write with locking
+// save_photo implementation - performs safe capture+write with locking
 void save_photo(bool time_known) {
+  // Acquire lock
   if (cameraLock) {
     if (xSemaphoreTake(cameraLock, pdMS_TO_TICKS(3000)) != pdTRUE) {
       Serial.println("save_photo: camera busy");
@@ -133,7 +177,7 @@ void save_photo(bool time_known) {
     }
   }
 
-  camera_fb_t *fb = flush_and_get_new_fb();
+  camera_fb_t *fb = flush_and_get_new_fb(/*retries=*/10, /*delay_ms=*/80, /*sample_size=*/64);
   if (!fb) {
     Serial.println("save_photo: no fresh framebuffer");
     if (cameraLock) xSemaphoreGive(cameraLock);
@@ -339,8 +383,8 @@ static esp_err_t capture_get_handler(httpd_req_t *req) {
     }
   }
 
-  // flush and get a fresh fb
-  camera_fb_t *fb = flush_and_get_new_fb();
+  // flush and get a fresh fb that differs from the previously-held one
+  camera_fb_t *fb = flush_and_get_new_fb(/*retries=*/10, /*delay_ms=*/80, /*sample_size=*/64);
   if (!fb) {
     Serial.println("capture: no fresh framebuffer");
     if (cameraLock) xSemaphoreGive(cameraLock);
