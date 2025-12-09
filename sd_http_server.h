@@ -11,7 +11,11 @@ void sdws_handleClient();
 void sdws_setMaxFilesToKeep(size_t maxFiles);
 void sdws_enforceRetentionPolicy();
 
-// NOTE: captureAndSave() is implemented in the main sketch and is called by the /snap endpoint.
-extern String captureAndSave();
+// Debug/status endpoint
+String sdws_getStatus(); // returns a short text status about SD mount and mountpoint
+
+// New: print a detailed listing of files on the SD to Serial for debugging.
+// This prints full paths (as detected by the module) and file sizes.
+void sdws_debugList();
 
 #endif // SD_HTTP_SERVER_H
