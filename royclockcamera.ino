@@ -6,6 +6,7 @@
   - single FreeRTOS mutex (cameraLock) to serialize camera access
   - flush_and_get_new_fb() to force a fresh frame, with retries
   - binary writes + fflush+fsync
+  - added save_photo(bool) to fix compile error
 */
 
 #include "esp_camera.h"
@@ -121,6 +122,48 @@ static camera_fb_t* flush_and_get_new_fb(int retries = 6, int delay_ms = 80) {
     delay(delay_ms);
   }
   return NULL;
+}
+
+// save_photo implementation (was missing) - performs the same safe capture+write with locking
+void save_photo(bool time_known) {
+  if (cameraLock) {
+    if (xSemaphoreTake(cameraLock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      Serial.println("save_photo: camera busy");
+      return;
+    }
+  }
+
+  camera_fb_t *fb = flush_and_get_new_fb();
+  if (!fb) {
+    Serial.println("save_photo: no fresh framebuffer");
+    if (cameraLock) xSemaphoreGive(cameraLock);
+    return;
+  }
+
+  String filename;
+  if (time_known) filename = make_dated_filename();
+  else filename = make_numbered_filename();
+
+  Serial.print("Taking picture: ");
+  Serial.println(filename);
+
+  FILE *file = fopen(filename.c_str(), "wb");
+  if (file != NULL) {
+    size_t written = fwrite(fb->buf, 1, fb->len, file);
+    fflush(file);
+    int fd = fileno(file);
+    if (fd >= 0) fsync(fd);
+    Serial.printf("File saved: %s (bytes: %u)\n", filename.c_str(), (unsigned)written);
+    fclose(file);
+  } else {
+    Serial.println("Could not open file for writing");
+    esp_camera_fb_return(fb);
+    if (cameraLock) xSemaphoreGive(cameraLock);
+    return;
+  }
+
+  esp_camera_fb_return(fb);
+  if (cameraLock) xSemaphoreGive(cameraLock);
 }
 
 // ---------- Streaming handler (serialize camera access) ----------
@@ -577,4 +620,3 @@ void loop() {
     delay(200);
   }
 }
-
