@@ -41,5 +41,5 @@
 *.dwo
 
 # secrets
-secrets.h
+secrets*.h
 
