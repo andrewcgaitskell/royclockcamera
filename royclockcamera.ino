@@ -1,71 +1,44 @@
 /*
-  ESP32-CAM (AI-Thinker) hourly capture + SD HTTP server
-  - Improved SD mount handling (tries root mount then /sdcard fallback)
-  - Ensures files are written into active mountpoint (sdRoot)
-  - flush() + close() + small delay after write to reduce chance of lost writes
-  - Avoids writing if SD not mounted
-  - Reduced default LED brightness; see hardware note in message
+  ESP32-CAM SD card capture with accurate local time filenames
+  + File listing & download endpoints (web) using esp_http_server
 
-  IMPORTANT: If you're powering a WS2811 strip, use a proper 5V supply with
-  sufficient current and a common ground. Brownouts during writes will
-  cause resets and lost files.
+  Adapted from your working sketch. Adds:
+  - /files  -> simple HTML listing of files on SD card (links to /download)
+  - /download?file=<path-or-name> -> streams the requested file for download
+  - /capture -> trigger an immediate dated capture and return download link
+
+  Board: AI-Thinker ESP32-CAM (uses same camera config as your working sketch)
 */
 
 #include "esp_camera.h"
-#include "WiFi.h"
-#include "FS.h"
-#include "SD_MMC.h"
-#include <time.h>
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_http_server.h"
 
-#include <Adafruit_NeoPixel.h> // WS2811/NeoPixel support
+// Time
+#include "time.h"
 
-#include "sd_http_server.h" // web module
-#include "secrets.h" // ssid and pw
+// MicroSD (ESP-IDF style)
+#include "driver/sdmmc_host.h"
+#include "driver/sdmmc_defs.h"
+#include "sdmmc_cmd.h"
+#include "esp_vfs_fat.h"
 
-// --------- CONFIG ---------
-const char* WIFI_SSID = WIFI_SSID_34;
-const char* WIFI_PASS = WIFI_PASSWORD_34;
+#include <ESPmDNS.h>
+#include <dirent.h>
 
-const char* AP_SSID = "ESP32-CAM-SD";  // AP SSID if no STA credentials provided
-const char* AP_PASS = "12345678";
+#include "secrets_34.h"
+#include "secrets_roy.h"
 
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 0;         // set to your timezone offset in seconds
-const int   daylightOffset_sec = 0;
+#define PART_BOUNDARY "123456789000000000000987654321"
+#define CAMERA_MODEL_AI_THINKER
 
-const size_t maxFilesToKeep = 0; // retention policy: 0 = disabled
-
-unsigned long lastPhotoEpoch = 0;
-int lastCaptureHour = -1;
-
-//
-// --------- WS2811 (NeoPixel) CONFIG ---------
-// Change these to match your LED wiring and count.
-// If you don't want LEDs, set LED_COUNT to 0.
-#define LED_PIN         4      // GPIO used to drive WS2811 / NeoPixel data
-#define LED_COUNT       8      // number of LEDs in the strip (set 0 to disable)
-#define LED_BRIGHTNESS  30     // reduced default brightness to lower current draw (0-255)
-
-static Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-void ws_init() {
-  if (LED_COUNT == 0) return;
-  strip.begin();
-  strip.setBrightness(LED_BRIGHTNESS);
-  strip.show();
-}
-void ws_on(uint8_t r = 255, uint8_t g = 255, uint8_t b = 255) {
-  if (LED_COUNT == 0) return;
-  for (uint16_t i = 0; i < strip.numPixels(); ++i) strip.setPixelColor(i, strip.Color(r,g,b));
-  strip.show();
-}
-void ws_off() {
-  if (LED_COUNT == 0) return;
-  strip.clear(); strip.show();
-}
-
-//
-// --------- CAMERA PINS for AI-THINKER ---------
+// Camera Pin definition for AI Thinker module
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -83,190 +56,415 @@ void ws_off() {
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ------------------ SD mount handling ------------------
-// sdRoot will be either "" (if SD mounted at "/") or "/sdcard" (if mounted at that mountpoint)
-static String sdRoot = "";
-static bool sdMounted = false;
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-void listSdRoot() {
-  // open the correct root depending on mountpoint
-  String rootPath = sdRoot.length() ? sdRoot : String("/");
-  File root = SD_MMC.open(rootPath.c_str());
-  if (!root) {
-    Serial.printf("listSdRoot: unable to open %s after mount.\n", rootPath.c_str());
-    return;
-  }
-  Serial.printf("Root directory listing for %s:\n", rootPath.c_str());
+httpd_handle_t stream_httpd = NULL;
+camera_config_t config;
+
+int file_number = 0;
+bool internet_connected = false;
+unsigned long lastNtpSync = 0;
+int lastPhotoHour = -1;
+
+// ---------- Streaming handler (unchanged) ----------
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t *_jpg_buf = NULL;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
   while (true) {
-    File entry = root.openNextFile();
-    if (!entry) break;
-    Serial.printf("  %s  %s  %u bytes\n",
-                  entry.isDirectory() ? "DIR " : "FILE",
-                  entry.name(), entry.size());
-    entry.close();
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      if (fb->width > 400) {
+        if (fb->format != PIXFORMAT_JPEG) {
+          bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+          esp_camera_fb_return(fb);
+          fb = NULL; // Explicitly clear pointer
+          if (!jpeg_converted) {
+            Serial.println("JPEG compression failed");
+            res = ESP_FAIL;
+          }
+        } else {
+          _jpg_buf_len = fb->len;
+          _jpg_buf = fb->buf;
+        }
+      }
+    }
+    if (res == ESP_OK) {
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL; // Always clear!
+      _jpg_buf = NULL;
+    } else if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    if (res != ESP_OK) break;
+    delay(1000);
   }
-  root.close();
+  return res;
 }
 
-// Try mounting SD. Returns true on success and sets sdRoot appropriately.
-bool tryMountSDVariants() {
-  // First try mount without specifying mountpoint (root "/")
-  Serial.println("Attempting SD_MMC.begin() (root mount)...");
-  if (SD_MMC.begin()) {
-    uint8_t ctype = SD_MMC.cardType();
-    if (ctype != CARD_NONE) {
-      sdMounted = true;
-      sdRoot = ""; // root is SD
-      Serial.println("SD_MMC mounted at root (/).");
-      listSdRoot();
-      return true;
-    } else {
-      SD_MMC.end();
-      Serial.println("SD_MMC.begin() returned CARD_NONE.");
-    }
-  } else {
-    Serial.println("SD_MMC.begin() (root) failed.");
-  }
+// ---------- Camera server and other URIs ----------
+void register_stream_endpoint(httpd_handle_t server);
+static esp_err_t files_get_handler(httpd_req_t *req);
+static esp_err_t download_get_handler(httpd_req_t *req);
+static esp_err_t capture_get_handler(httpd_req_t *req);
 
-  // Fallback: try mounting at /sdcard with 1-bit mode (works on many AI-Thinker boards)
-  Serial.println("Attempting SD_MMC.begin(\"/sdcard\", true) (1-bit mount)...");
-  if (SD_MMC.begin("/sdcard", true)) {
-    uint8_t ctype = SD_MMC.cardType();
-    if (ctype != CARD_NONE) {
-      sdMounted = true;
-      sdRoot = "/sdcard";
-      Serial.println("SD_MMC mounted at /sdcard.");
-      listSdRoot();
-      return true;
-    } else {
-      SD_MMC.end();
-      Serial.println("SD_MMC.begin(\"/sdcard\", true) returned CARD_NONE.");
-    }
-  } else {
-    Serial.println("SD_MMC.begin(\"/sdcard\", true) failed.");
-  }
+void startCameraServer() {
+  httpd_config_t config_http = HTTPD_DEFAULT_CONFIG();
+  config_http.server_port = 80;
 
-  sdMounted = false;
-  sdRoot = "";
+  // start server
+  if (httpd_start(&stream_httpd, &config_http) == ESP_OK) {
+    // streaming root
+    httpd_uri_t index_uri = {
+      .uri       = "/",
+      .method    = HTTP_GET,
+      .handler   = stream_handler,
+      .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(stream_httpd, &index_uri);
+
+    // files listing
+    httpd_uri_t files_uri = {
+      .uri       = "/files",
+      .method    = HTTP_GET,
+      .handler   = files_get_handler,
+      .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(stream_httpd, &files_uri);
+
+    // download
+    httpd_uri_t download_uri = {
+      .uri       = "/download",
+      .method    = HTTP_GET,
+      .handler   = download_get_handler,
+      .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(stream_httpd, &download_uri);
+
+    // capture now
+    httpd_uri_t capture_uri = {
+      .uri       = "/capture",
+      .method    = HTTP_GET,
+      .handler   = capture_get_handler,
+      .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(stream_httpd, &capture_uri);
+  } else {
+    Serial.println("Failed to start HTTP server");
+  }
+}
+
+// ---------- WiFi, mDNS, time, SD init (mostly unchanged) ----------
+bool init_wifi() {
+  const char* ssids[2] = {WIFI_SSID_34, WIFI_SSID_79};
+  const char* passwords[2] = {WIFI_PASSWORD_34, WIFI_PASSWORD_79};
+  const int maxConnAttempts = 10;
+  for (int i = 0; i < 2; i++) {
+    int connAttempts = 0;
+    Serial.println("\r\nConnecting to: " + String(ssids[i]));
+    WiFi.begin(ssids[i], passwords[i]);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+      if (connAttempts++ > maxConnAttempts) break;
+    }
+    if (WiFi.status() == WL_CONNECTED) return true;
+    WiFi.disconnect();
+  }
   return false;
 }
 
-// ------------------ helpers ------------------
-// produce filename WITHOUT leading slash
-String timeStampFilenameNoSlash(struct tm &tm) {
-  char buf[64];
-  // img_YYYYMMDD_HHMMSS.jpg (no leading slash)
-  sprintf(buf, "img_%04d%02d%02d_%02d%02d%02d.jpg",
-          tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-          tm.tm_hour, tm.tm_min, tm.tm_sec);
-  return String(buf);
+bool init_mdns() {
+  if (!MDNS.begin("royclockcam_1")) {
+    Serial.println("Error setting up MDNS responder!");
+    while (1) delay(1000);
+    return false;
+  }
+  Serial.println("mDNS responder started");
+  MDNS.addService("http", "tcp", 80);
+  return true;
 }
 
-// forward extern for web module /snap
-extern String captureAndSave();
+void setup_time() {
+  // Set timezone for UK/London, with DST
+  setenv("TZ", "GMT0BST,M3.5.0/01,M10.5.0/02", 1);
+  tzset();
 
-// capture photo and save to SD card, returns saved full path or empty string on error
-String captureAndSave() {
-  if (!sdMounted) {
-    Serial.println("SD not mounted - capture will not save file. Capture aborted for safety.");
-    return String(); // avoid attempting to write when no SD available
-  }
+  // London December: GMT, UTC+0, no DST (handled in TZ)
+  configTime(0, 0, "pool.ntp.org");
 
-  const int maxAttempts = 3;
-  camera_fb_t * fb = nullptr;
-  int attempt = 0;
-
-  // Turn on WS2811 lights 2 seconds before capture
-  if (LED_COUNT > 0) {
-    Serial.println("Turning LEDs ON (pre-capture)...");
-    ws_on();           // default white, change color by passing RGB
-    delay(2000);       // wait 2s for lighting to stabilize
-  }
-
-  // Try to get a valid framebuffer, retry a few times
-  for(attempt = 0; attempt < maxAttempts; ++attempt) {
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.printf("Attempt %d: Camera capture returned NULL, retrying...\n", attempt+1);
-      delay(200);
-      continue;
-    }
-    if (fb->len == 0) {
-      Serial.printf("Attempt %d: Camera capture length 0, returning fb and retrying...\n", attempt+1);
-      esp_camera_fb_return(fb);
-      fb = nullptr;
-      delay(200);
-      continue;
-    }
-    break; // valid fb acquired
-  }
-
-  if(!fb){
-    Serial.println("Camera capture failed after retries");
-    if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (capture failed)"); ws_off(); }
-    return String();
-  }
-
-  // build full path with mountpoint
-  time_t now;
-  time(&now);
-  struct tm timeinfo;
-  gmtime_r(&now, &timeinfo);
-
-  String name = timeStampFilenameNoSlash(timeinfo);
-  String fullPath;
-  if (sdRoot.length()) fullPath = sdRoot + "/" + name;
-  else fullPath = "/" + name;
-
-  Serial.printf("Saving image to: %s  size=%u\n", fullPath.c_str(), fb->len);
-
-  File file = SD_MMC.open(fullPath.c_str(), FILE_WRITE);
-  if(!file){
-    Serial.println("Failed to open file for writing");
-    esp_camera_fb_return(fb);
-    if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (file open failed)"); ws_off(); }
-    return String();
-  }
-
-  size_t written = file.write(fb->buf, fb->len);
-  // try flush if available
-  #if defined(FILE_WRITE) || defined(ARDUINO_ARCH_ESP32)
-  // Many ESP32 File implementations support flush(); it's harmless if not present.
-  file.flush();
-  #endif
-  file.close();
-
-  // small pause to let VFS settle (helps with intermittent card issues)
-  delay(150);
-
-  // return framebuffer to driver so it can be reused / freed
-  esp_camera_fb_return(fb);
-
-  if (written != fb->len) {
-    Serial.printf("Warning: wrote %u of %u bytes to %s\n", (unsigned)written, (unsigned)fb->len, fullPath.c_str());
-    if (LED_COUNT > 0) { Serial.println("Turning LEDs OFF (incomplete write)"); ws_off(); }
-    // Optionally remove incomplete file
-    // SD_MMC.remove(fullPath.c_str());
-    return String();
-  }
-
-  // keep lights on for 2 seconds after capture (post-capture)
-  if (LED_COUNT > 0) {
+  // Wait for time to be set
+  time_t now = 0;
+  struct tm timeinfo = {0};
+  int retry = 0;
+  const int retry_count = 10;
+  while (timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count) {
+    Serial.printf("Waiting for system time to be set... (%d/%d)\n", retry, retry_count);
     delay(2000);
-    Serial.println("Turning LEDs OFF (post-capture)");
-    ws_off();
+    time(&now);
+    localtime_r(&now, &timeinfo);
   }
-
-  lastPhotoEpoch = now;
-  lastCaptureHour = timeinfo.tm_hour;
-
-  sdws_enforceRetentionPolicy();
-  return fullPath;
+  Serial.printf("Current time: %s", asctime(&timeinfo));
 }
 
-// ------------------ camera init ------------------
-void initCamera(uint8_t fbCount = 1) {
-  camera_config_t config;
+static esp_err_t init_sdcard() {
+  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+  esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+    .format_if_mount_failed = false,
+    .max_files = 5,
+  };
+  sdmmc_card_t *card;
+  Serial.println("Mounting SD card...");
+  esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+  if (ret == ESP_OK) {
+    Serial.println("SD card mount successfully!");
+  } else {
+    Serial.printf("Failed to mount SD card VFAT filesystem. Error: %s\n", esp_err_to_name(ret));
+  }
+  return ret;
+}
+
+// ---------- Image saving helpers (modified to return filename) ----------
+String make_dated_filename() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+
+  char strftime_buf[32];
+  strftime(strftime_buf, sizeof(strftime_buf), "%Y%m%d_%H%M%S", &timeinfo);
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/sdcard/capture_%s.jpg", strftime_buf);
+  return String(filename);
+}
+
+String make_numbered_filename() {
+  file_number++;
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/sdcard/capture_%d.jpg", file_number);
+  return String(filename);
+}
+
+// returns empty string on failure, or full path on success
+String save_photo_numbered_str() {
+  String filename = make_numbered_filename();
+  Serial.print("Taking picture: ");
+  Serial.println(filename);
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed (DMA overflow?)");
+    return String();
+  }
+
+  FILE *file = fopen(filename.c_str(), "w");
+  if (file != NULL) {
+    fwrite(fb->buf, 1, fb->len, file);
+    Serial.printf("File saved: %s\n", filename.c_str());
+    fclose(file);
+  } else {
+    Serial.println("Could not open file for writing");
+    esp_camera_fb_return(fb);
+    return String();
+  }
+  esp_camera_fb_return(fb);
+  return filename;
+}
+
+String save_photo_dated_str() {
+  String filename = make_dated_filename();
+  Serial.print("Taking picture: ");
+  Serial.println(filename);
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed (DMA overflow?)");
+    return String();
+  }
+
+  FILE *file = fopen(filename.c_str(), "w");
+  if (file != NULL) {
+    fwrite(fb->buf, 1, fb->len, file);
+    Serial.printf("File saved: %s\n", filename.c_str());
+    fclose(file);
+  } else {
+    Serial.println("Could not open file for writing");
+    esp_camera_fb_return(fb);
+    return String();
+  }
+  esp_camera_fb_return(fb);
+  return filename;
+}
+
+void save_photo(bool time_known) {
+  // Defensive: Ensure previous framebuffers are released by called functions
+  if (time_known) {
+    save_photo_dated_str();
+  } else {
+    save_photo_numbered_str();
+  }
+}
+
+// ---------- Helpers for content type ----------
+String getContentTypeForFilename(const String& path) {
+  String p = path;
+  p.toLowerCase();
+  if (p.endsWith(".htm") || p.endsWith(".html")) return "text/html";
+  if (p.endsWith(".css")) return "text/css";
+  if (p.endsWith(".js")) return "application/javascript";
+  if (p.endsWith(".png")) return "image/png";
+  if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+  if (p.endsWith(".gif")) return "image/gif";
+  if (p.endsWith(".txt")) return "text/plain";
+  return "application/octet-stream";
+}
+
+// ---------- /files handler: list files on SD (simple HTML) ----------
+static esp_err_t files_get_handler(httpd_req_t *req) {
+  // Send a basic HTML page in chunks (avoid building one big string)
+  const char* header = "<!doctype html><html><head><meta charset='utf-8'><title>ESP32-CAM SD Files</title></head><body><h2>Files on SD card</h2>";
+  httpd_resp_send_chunk(req, header, strlen(header));
+
+  DIR *dir = opendir("/sdcard");
+  if (!dir) {
+    const char* no = "<p>Unable to open /sdcard. Is the card mounted?</p></body></html>";
+    httpd_resp_send_chunk(req, no, strlen(no));
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+  }
+
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != NULL) {
+    if (ent->d_type == DT_DIR) {
+      // skip directories for now
+      continue;
+    }
+    String name = String(ent->d_name);
+    String line = "<a href=\"/download?file=" + name + "\">" + name + "</a><br>\n";
+    httpd_resp_send_chunk(req, line.c_str(), line.length());
+  }
+  closedir(dir);
+
+  const char* footer = "<hr><small>Use /download?file=FILENAME to download. Use /capture to take a photo now.</small></body></html>";
+  httpd_resp_send_chunk(req, footer, strlen(footer));
+  httpd_resp_send_chunk(req, NULL, 0); // end of response
+  return ESP_OK;
+}
+
+// ---------- /download handler: stream file for download ----------
+static esp_err_t download_get_handler(httpd_req_t *req) {
+  char buf[512];
+  // Get query string
+  char query[256];
+  int ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+  if (ret != ESP_OK) {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+  char file_param[224];
+  if (httpd_query_key_value(query, "file", file_param, sizeof(file_param)) != ESP_OK) {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  String requested = String(file_param);
+  // Normalize requested path: if user provided basename, try /sdcard/<name>
+  String path;
+  if (requested.startsWith("/sdcard/") || requested.startsWith("/")) {
+    path = requested;
+  } else {
+    path = "/sdcard/" + requested;
+  }
+
+  // Try to open file
+  FILE *f = fopen(path.c_str(), "rb");
+  if (!f) {
+    // as a fallback, try leading slash removal and also try /sdcard/<basename>
+    // already tried /sdcard/<basename> above. If failed, respond 404
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  // Determine filename for Content-Disposition
+  String filename = requested;
+  int pos = filename.lastIndexOf('/');
+  if (pos >= 0) filename = filename.substring(pos + 1);
+
+  String ctype = getContentTypeForFilename(filename);
+  httpd_resp_set_type(req, ctype.c_str());
+
+  // Content-Disposition header to force download
+  String disp = "attachment; filename=\"" + filename + "\"";
+  httpd_resp_set_hdr(req, "Content-Disposition", disp.c_str());
+
+  // Stream file in chunks
+  const size_t chunk_size = 1024;
+  static uint8_t chunk[chunk_size];
+  size_t r;
+  while ((r = fread(chunk, 1, chunk_size, f)) > 0) {
+    if (httpd_resp_send_chunk(req, (const char*)chunk, r) != ESP_OK) {
+      fclose(f);
+      return ESP_FAIL;
+    }
+  }
+  fclose(f);
+
+  // signal end of chunks
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// ---------- /capture handler: take a dated photo and return link ----------
+static esp_err_t capture_get_handler(httpd_req_t *req) {
+  Serial.println("HTTP /capture requested - triggering capture");
+  String saved = save_photo_dated_str(); // returns full path or empty
+  if (saved.length()) {
+    // produce a simple text response with link
+    String rel = saved;
+    // make a relative param for /download (strip leading /sdcard/ if present)
+    if (rel.startsWith("/sdcard/")) rel = rel.substring(strlen("/sdcard/"));
+    if (rel.startsWith("/")) rel = rel.substring(1);
+    String resp = "Saved: " + saved + "\nDownload URL: /download?file=" + rel + "\n";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, resp.c_str(), resp.length());
+    return ESP_OK;
+  } else {
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Capture failed", strlen("Capture failed"));
+    return ESP_FAIL;
+  }
+}
+
+// ---------- Main control ----------
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  Serial.setDebugOutput(false);
+
+  // Camera pin setup
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -285,98 +483,73 @@ void initCamera(uint8_t fbCount = 1) {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 15;
+    config.fb_count = 1;
+  }
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_SVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = fbCount; // use 1 to reduce PSRAM/pin conflicts
 
-  Serial.printf("Initializing camera with fb_count=%d...\n", fbCount);
+  if (init_wifi()) {
+    internet_connected = true;
+    Serial.println("Internet connected");
+    setup_time();
+  } else {
+    internet_connected = false;
+    Serial.println("WiFi failed");
+  }
+
+  init_mdns();
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
-    // continue so diagnostics can be gathered
-  } else {
-    Serial.println("Camera initialized.");
+    return;
   }
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println();
-  Serial.println("ESP32-CAM hourly capture + SD HTTP server - SD & power-hardening build");
-
-  // init LEDs (if present)
-  ws_init();
-
-  // Try to mount SD (root or /sdcard fallback)
-  sdMounted = tryMountSDVariants();
-  if (!sdMounted) {
-    Serial.println("WARNING: SD card not mounted. /snap will not write images until SD is mounted.");
+  esp_err_t sd_err = init_sdcard();
+  if (sd_err != ESP_OK) {
+    Serial.printf("SD Card init failed with error 0x%x\n", sd_err);
+    // still continue so streaming may work (but /files and /download will fail)
   }
 
-  // Init camera (use 1 fb to reduce conflicts)
-  initCamera(1);
+  Serial.print("Camera Stream Ready! Go to: http://");
+  Serial.println(WiFi.localIP());
 
-  // -- network --
-  if (strlen(WIFI_SSID) > 0) {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("Connecting to WiFi SSID=%s ...\n", WIFI_SSID);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-      delay(500);
-      Serial.print(".");
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("Connected, IP: ");
-      Serial.println(WiFi.localIP());
-      // NTP sync handled elsewhere / as before
-    } else {
-      Serial.println("Failed to connect, starting AP instead");
-      WiFi.softAP(AP_SSID, AP_PASS);
-      Serial.print("AP IP address: ");
-      Serial.println(WiFi.softAPIP());
-    }
-  } else {
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.print("AP IP address: ");
-    Serial.println(WiFi.softAPIP());
-  }
-
-  // start webserver
-  sdws_setMaxFilesToKeep(maxFilesToKeep);
-  sdws_begin();
-
-  // init last capture hour
-  time_t tt = time(nullptr);
-  if (tt > 0) {
-    struct tm tmnow;
-    gmtime_r(&tt, &tmnow);
-    lastCaptureHour = tmnow.tm_hour;
-  } else lastCaptureHour = -1;
+  startCameraServer();
 }
 
 void loop() {
-  sdws_handleClient();
-
-  time_t now = time(nullptr);
-  if (now > 0) {
-    struct tm timeinfo;
-    gmtime_r(&now, &timeinfo);
-    if (timeinfo.tm_hour != lastCaptureHour) {
-      if (timeinfo.tm_min == 0) {
-        Serial.printf("Hour changed to %02d -- taking photo\n", timeinfo.tm_hour);
-        String saved = captureAndSave();
-        if (saved.length()) {
-          Serial.printf("Saved photo: %s\n", saved.c_str());
-        } else {
-          Serial.println("Failed to save photo.");
-        }
-      }
-    }
+  // Sync time from NTP every hour if connected
+  if (internet_connected && millis() - lastNtpSync > 3600000UL) {
+    setup_time();
+    lastNtpSync = millis();
   }
 
-  delay(1000);
+  // Check time and capture photo on the hour
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+
+  bool time_known = (timeinfo.tm_year >= (2016 - 1900)) && internet_connected;
+
+  if (time_known && timeinfo.tm_min == 0 && timeinfo.tm_sec == 0 && timeinfo.tm_hour != lastPhotoHour) {
+    Serial.printf("Camera taking photo at %02d:00:00\n", timeinfo.tm_hour);
+    save_photo(true);
+    lastPhotoHour = timeinfo.tm_hour;
+    delay(2000);
+  } else if (!time_known && lastPhotoHour != -1) {
+    // Fall back: save numbered if time unknown
+    save_photo(false);
+    lastPhotoHour = -1;
+    delay(2000);
+  } else {
+    delay(200);
+  }
 }
