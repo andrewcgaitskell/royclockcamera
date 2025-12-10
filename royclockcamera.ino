@@ -451,7 +451,7 @@ bool init_wifi() {
 }
 
 bool init_mdns() {
-  if (!MDNS.begin("royclockcam_1")) {
+  if (!MDNS.begin("royclockcam_2")) {
     Serial.println("Error setting up MDNS responder!");
     while (1) delay(1000);
     return false;
